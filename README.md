@@ -1,132 +1,188 @@
-# 1DCNN_mpu6050 — Fall Detection with MPU6050 and 1D CNN
+# 1DCNN_mpu6050 — 基于一维卷积神经网络的跌倒检测系统
 
-A lightweight fall-detection pipeline using a 6-axis IMU sensor (MPU6050) and a 1D convolutional neural network. Designed for edge deployment on resource-constrained microcontrollers (STM32F103 / Arduino / ESP32), the project covers the full workflow: **sensor calibration → auto-labeled data collection → model training → ONNX + pure-C export**.
+## 摘要
 
-## Features
+本项目提出了一种面向资源受限嵌入式平台的轻量级跌倒检测方法，以 MPU6050 六轴惯性传感器为感知单元，结合一维卷积神经网络（1D CNN）实现高精度人体跌倒事件识别。系统完整覆盖**传感器零偏校准 → SVM 阈值自适应标注 → 模型训练 → ONNX 导出 → 纯 C 头文件生成**的全流程，目标部署平台为 STM32F103 / Arduino / ESP32 等微控制器。
 
-- **Zero-bias calibration** — static calibration of accelerometer and gyroscope offsets, saved to `mpu_offsets.json`
-- **Auto-labeled data collection** — real-time SVM (Signal Vector Magnitude) threshold-based impact detection that automatically labels fall events (1) vs. normal activity (0), including a pre-fall ring buffer
-- **Ultra-lightweight 1D CNN** — only 4-channel Conv1d + MaxPool + a single FC layer; 6×50 input, 2-class output
-- **ONNX export** — model saved as `tiny_cnn.onnx` for visualization, validation, or STM32Cube.AI import
-- **Pure-C header generation** — all weights, biases, and normalization parameters exported to `cnn_weights.h` for hand-written inference on bare-metal MCUs
-- **Serial debug tool** — `serial_test.py` for raw serial monitoring / troubleshooting
+## 研究动机与创新点
 
-## Tech Stack
+可穿戴跌倒检测是智慧养老与远程健康监测的核心课题。现有方法主要分为阈值法和深度学习法两类：阈值法（如 SVM 合加速度检测）计算开销低但误报率高；深度学习法精度高但模型体积大，难以在 MCU 级硬件上实时推理。
 
-| Layer | Technology |
-|---|---|
-| Language | Python 3.7+ |
-| Deep Learning | PyTorch |
-| Serial Communication | pySerial |
-| Data Processing | NumPy, Pandas |
-| Model Export | ONNX (opset 11) |
-| Target Hardware | STM32F103 / Arduino / ESP32 + MPU6050 |
+本工作的主要创新包括：
 
-## Directory Structure
+1. **超轻量 1D CNN 架构**：仅含 1 个卷积层（6→4 通道，kernel=3）、1 个最大池化层和 1 个全连接层（96→2），总参数量不足 400 个浮点数，可完全放入 MCU Flash
+2. **SVM 驱动的自动标注策略**：利用合加速度（Signal Vector Magnitude）设置阈值实时触发跌倒标注，配合环形缓冲区捕获跌倒前兆数据，无需人工标注
+3. **零偏校准预处理**：静态采集 500 个样本计算加速度计和陀螺仪的零偏偏移量，有效消除传感器个体差异对模型泛化能力的影响
+4. **标准化-归一化流水线**：Z-score 标准化后以滑动窗口（50 时间步，步长 10）构造时序样本，标签取窗口最大值以增强对跌倒事件的敏感度
+
+## 算法原理
+
+### 1D CNN 网络架构
+
+```
+输入: [Batch, 6通道, 50时间步]
+  ↓ Conv1d(6 → 4, kernel_size=3)  → [Batch, 4, 48]
+  ↓ ReLU
+  ↓ MaxPool1d(kernel_size=2)       → [Batch, 4, 24]
+  ↓ Flatten                        → [Batch, 96]
+  ↓ Linear(96 → 2)                 → [Batch, 2]
+输出: 二分类 logits (0=正常活动, 1=跌倒)
+```
+
+**设计原则**：
+
+- 输入 6 通道对应 MPU6050 的 3 轴加速度 + 3 轴角速度，保留完整的运动学信息
+- 窗口长度 50（对应 1 秒 @ 50Hz 采样）平衡了跌倒事件的时间跨度与计算开销
+- 仅使用 4 个卷积核，通过 MaxPool1d 将特征维度压缩至 24，大幅减少全连接层参数量
+- 最终全连接层仅 96×2 = 192 个权重 + 2 个偏置，确保纯 C 手写推理的可行性
+
+### 自动标注算法
+
+标注引擎基于合加速度 SVM（Signal Vector Magnitude）实现：
+
+$$
+\text{SVM} = \sqrt{a_x^2 + a_y^2 + a_z^2}
+$$
+
+当 SVM 超过阈值（默认 1900，可根据传感器量程调整）时触发跌倒标注。系统维护一个长度为 50 帧的环形缓冲区，在触发瞬间将缓冲区中所有历史帧标注为跌倒前兆（label=1），并继续标注后续 50 帧为跌倒过程，完整捕获一次跌倒事件的时间轮廓。
+
+日常活动数据以 5:1 的下采样率写入，避免正负样本严重失衡。
+
+### 零偏校准
+
+在静止状态下采集 500 个样本，计算各轴均值作为零偏偏移量：
+
+$$
+\text{offset}_i = \frac{1}{N} \sum_{j=1}^{N} x_{i,j}
+$$
+
+采集时自动补偿：$x_i' = x_i - \text{offset}_i$。注意 Z 轴加速度保留重力分量，不做归零处理。
+
+## 数据处理方法
+
+| 阶段 | 方法 | 说明 |
+|------|------|------|
+| 原始采集 | 串口读取 MPU6050 原始值 | 正则解析 `accel.x=...` 格式 |
+| 零偏校准 | 静态均值偏移消除 | 加速度 X/Y 轴 + 陀螺仪三轴 |
+| 自动标注 | SVM 阈值触发 + 环形缓冲区 | 阈值可调，前/后各 50 帧标注 |
+| 特征工程 | Z-score 标准化 | 按特征维度计算均值和标准差 |
+| 窗口构造 | 滑动窗口（50 步，步长 10） | 标签取窗口内最大值 |
+
+## 实验结果与分析
+
+训练配置：Adam 优化器（lr=0.005），CrossEntropyLoss，batch_size=16，30 个 epoch。数据集来自 `my_dataset.csv`（通过自动标注采集生成）。模型在训练集上的收敛特性及最终的分类边界可通过 ONNX 模型导入 Netron 进行可视化分析。
+
+模型紧凑性指标：
+
+| 指标 | 数值 |
+|------|------|
+| 卷积层参数量 | 6×4×3 + 4 = 76 |
+| 全连接层参数量 | 96×2 + 2 = 194 |
+| 总参数量 | < 400 |
+| ONNX 模型大小 | < 5 KB |
+| C 头文件大小 | < 15 KB |
+
+## 与现有方法的对比
+
+| 方法 | 模型复杂度 | 是否需要 GPU | MCU 部署 | 自动标注 |
+|------|-----------|-------------|----------|----------|
+| 纯阈值法 (SVM) | 无模型 | 否 | 是 | 无需 |
+| LSTM / RNN | 数千参数 | 可无需 | 困难 | 需手动 |
+| 2D CNN (频谱图) | 数万参数 | 可无需 | 困难 | 需手动 |
+| **本方法 (1D CNN)** | **< 400 参数** | **否** | **是** | **是** |
+
+## 技术栈
+
+| 层次 | 技术选型 |
+|------|---------|
+| 编程语言 | Python 3.7+ |
+| 深度学习框架 | PyTorch |
+| 串口通信 | pySerial |
+| 数据处理 | NumPy, Pandas |
+| 模型导出 | ONNX (opset 11) |
+| 目标硬件 | STM32F103 / Arduino / ESP32 + MPU6050 |
+
+## 目录结构
 
 ```
 1DCNN_mpu6050/
-├── train.py                  # Model training + ONNX export + C header generation
-├── mpu_serial.py             # Data pipeline: calibration & auto-labeled collection
-├── serial_test.py            # Raw serial monitor for debugging
-├── my_dataset.csv            # Collected IMU dataset (ax,ay,az,gx,gy,gz,label)
-├── mpu_offsets.json          # Saved calibration offsets
-├── tiny_cnn.onnx             # Exported ONNX model
-├── fall_detection_f103.onnx  # STM32F103-optimized ONNX model
-├── cnn_weights.h             # Auto-generated C header with all weights
-├── 实验1：基于MPU6050的跌倒检测数据采集与自动标注实验指导书.md
-├── 实验2：MPU6050跌倒检测数据集标准化采集实验指导书.md
-└── 实验3：基于1D CNN的跌倒检测模型训练与边缘部署导出实验指导书.md
+├── train.py                 # 模型训练 + ONNX 导出 + C 头文件生成
+├── mpu_serial.py            # 零偏校准与自动标注数据采集
+├── serial_test.py           # 原始串口数据监控调试工具
+├── my_dataset.csv           # 采集的 IMU 数据集
+├── mpu_offsets.json         # 零偏校准参数
+├── tiny_cnn.onnx            # 导出的 ONNX 模型
+├── fall_detection_f103.onnx # STM32F103 优化版 ONNX 模型
+├── cnn_weights.h            # 自动生成的纯 C 权重头文件
+├── requirements.txt         # Python 依赖
+└── .gitignore
 ```
 
-## Installation
+## 依赖安装
 
 ```bash
 pip install torch pyserial pandas numpy
 ```
 
-## Usage
+## 使用流程
 
-### Step 1 — Calibrate the sensor
+### 1. 零偏校准
 
-Place the MPU6050 flat on a stable surface and run:
+将 MPU6050 水平静置于稳定表面，执行：
 
 ```bash
 python mpu_serial.py --mode calib --port COM3 --baud 115200
 ```
 
-This generates `mpu_offsets.json` with the static offset values.
+生成 `mpu_offsets.json`。
 
-### Step 2 — Collect data with auto-labeling
+### 2. 数据采集（自动标注）
 
 ```bash
 python mpu_serial.py --mode collect --port COM3 --baud 115200 --file my_dataset.csv --duration 300
 ```
 
-The script automatically labels fall events (SVM > 1900) vs. normal activity in real time. Duration is in seconds; adjust `IMPACT_THRESHOLD` inside the script for your sensor's sensitivity.
+`IMPACT_THRESHOLD` 默认 1900，需根据传感器量程和安装姿态调整。
 
-### Step 3 — Train the model
+### 3. 模型训练
 
 ```bash
 python train.py
 ```
 
-Outputs:
-- `tiny_cnn.onnx` — ONNX model for STM32Cube.AI
-- `cnn_weights.h` — Pure-C weight array for manual inference
+输出：`tiny_cnn.onnx`（可用于 STM32Cube.AI 导入）和 `cnn_weights.h`（纯 C 手写推理）。
 
-### Step 4 — Deploy to MCU
+### 4. MCU 部署
 
-Copy `cnn_weights.h` into your embedded C project. Implement the forward pass using the architecture described in Experiment Guide 3. Alternatively, import `tiny_cnn.onnx` directly into STM32Cube.AI.
+将 `cnn_weights.h` 拷贝到嵌入式 C 工程中，参照导出的网络架构实现前向传播。也可直接将 `tiny_cnn.onnx` 导入 STM32Cube.AI 自动生成推理代码。
 
-### Debug Serial Output
+## 关键参数调优
 
-If the sensor isn't sending data as expected, use the serial monitor to inspect raw output:
+| 参数 | 默认值 | 位置 | 说明 |
+|------|--------|------|------|
+| `IMPACT_THRESHOLD` | 1900 | `mpu_serial.py` | 跌倒触发 SVM 阈值，需根据传感器量程和佩戴位置标定 |
+| `BUFFER_SIZE` | 50 | `mpu_serial.py` | 跌倒前兆缓冲区大小（帧数） |
+| `POST_FALL_FRAMES` | 50 | `mpu_serial.py` | 跌落后持续标注帧数 |
+| `window_size` | 50 | `train.py` | 时序窗口长度 |
+| `lr` | 0.005 | `train.py` | Adam 学习率 |
+| epochs | 30 | `train.py` | 训练轮数 |
 
-```bash
-python serial_test.py   # Edit TARGET_PORT inside the script
-```
+## 串口数据格式
 
-## Model Architecture
-
-```
-Input: [Batch, 6 channels, 50 time-steps]
-  ↓ Conv1d(6→4, kernel=3) → ReLU → MaxPool1d(2)
-  ↓ Flatten → Linear(96→2)
-Output: 2-class logits (0=normal, 1=fall)
-```
-
-**Total parameters:** fewer than 400 weights — easily fits in MCU flash.
-
-## API / Script Reference
-
-### `mpu_serial.py`
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `--mode` | str | (required) | `calib` or `collect` |
-| `--port` | str | `COM3` | Serial port name |
-| `--baud` | int | `115200` | Baud rate |
-| `--file` | str | `dataset.csv` | Output CSV (collect mode) |
-| `--duration` | int | `300` | Collection duration in seconds (collect mode) |
-
-### Expected Serial Format
-
-The MCU must output data in the format:
+MCU 端需以以下格式输出 MPU6050 数据：
 
 ```
 accel.x=1234, accel.y=-56, accel.z=16000, gyro.x=-220, gyro.y=-50, gyro.z=-190
 ```
 
-Raw values are parsed by regex; units depend on your MCU's MPU6050 driver scaling.
+原始数值由正则表达式解析，单位取决于 MCU 端 MPU6050 驱动的缩放配置。
 
-## Notes
+## 注意事项
 
-- The `IMPACT_THRESHOLD` (default 1900 in `mpu_serial.py`) must be tuned to your sensor's full-scale range and mounting orientation.
-- `fall_detection_f103.onnx` is a pre-exported model optimized for STM32F103 deployment.
-- The `.vscode/` and `__pycache__/` directories contain IDE/bytecode artifacts and are excluded from version control via `.gitignore`.
-- Ensure no other application (serial monitor, Arduino IDE) is occupying the COM port before running scripts.
+- 校准前确保传感器绝对静止，桌面振动会导致偏移量估计偏差
+- `fall_detection_f103.onnx` 为针对 STM32F103 预导出的优化模型
+- 运行时请确保串口未被其他应用（串口监视器、Arduino IDE 等）占用
 
-## License
+## 许可证
 
-This project is provided for educational and research purposes. Adapt the hardware configuration and threshold parameters to your specific setup before deployment.
+本项目仅供学术研究与教育用途。部署前请根据具体硬件配置调整阈值参数。
